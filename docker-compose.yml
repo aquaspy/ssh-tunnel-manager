@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  ssh-tunnel-manager:
+    build: .
+    container_name: ssh-tunnel-manager
+    restart: unless-stopped
+    user: "1000:1000"
+    volumes:
+      - ssh-data:/data
+    ports:
+      - "5000:5000"
+    environment:
+      TZ: UTC
+    extra_hosts:               #  <‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑‑
+      - "host.docker.internal:host-gateway"
+      # now the name  host.docker.internal  inside the container
+      # resolves to the host‑side address
+volumes:
+  ssh-data:
+    name: ssh-tunnel-manager-data
