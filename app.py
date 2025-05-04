@@ -32,7 +32,7 @@ os.makedirs(SSH_DIR, exist_ok=True)
 try:
     os.chmod(SSH_DIR, 0o700)
 except Exception as exc:
-    print(f"Warning –&nbsp;cannot chmod {SSH_DIR}: {exc}")
+    print(f"Warning – cannot chmod {SSH_DIR}: {exc}")
 
 # ------------------------------------------------------------------
 # Flask / Socket‑IO
@@ -87,7 +87,7 @@ class SSHConnection:
             "-p", str(self.ssh_port),
             "-o", f"ServerAliveInterval={self.alive_interval}",
             "-o", f"ExitOnForwardFailure={'yes' if self.exit_on_failure else 'no'}",
-            "-v",                 # <-- 1×&nbsp;verbose; add -vv if you want more
+            "-v",                 # <-- 1× verbose; add -vv if you want more
             dest,
         ]
 
@@ -117,24 +117,29 @@ class SSHConnection:
             self.status_message = "Key permission error"
             return False
 
+        # Clear previous log entries when starting fresh
+        self.log_lines.clear()
+        self.log_lines.append(f"Starting connection at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
         try:
             self.process = subprocess.Popen(
                 self._build_cmd(),
-                stdout=subprocess.DEVNULL,          # we do not need stdout
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 bufsize=1
             )
         except Exception as exc:
             self.last_error = str(exc)
             self.status_message = "Failed to spawn ssh"
+            self.log_lines.append(f"Error: {self.last_error}")
             return False
 
         self.stderr_thread = threading.Thread(
             target=self._pump_stderr, daemon=True)
         self.stderr_thread.start()
 
-        # Give ssh a couple of seconds – it may need DNS / TCP handshake
-        for _ in range(6):          # 6 × 0.5&nbsp;s  ≈ 3&nbsp;s
+        # Give ssh a couple of seconds to establish connection
+        for _ in range(6):
             time.sleep(0.5)
             if self.process.poll() is not None:
                 break
@@ -142,7 +147,7 @@ class SSHConnection:
         if self.process.poll() is not None:  # died already
             self.active = False
             self.status_message = "Failed to start"
-            self.last_error = "\n".join(self.log_lines)
+            self.last_error = "\n".join(list(self.log_lines)[-10:])  # Last 10 lines
             return False
 
         self.active = True
@@ -171,6 +176,28 @@ class SSHConnection:
             self.status_message = "Connection failed"
             self.last_error = "\n".join(self.log_lines)
         return False
+
+    def check_health(self):
+        """
+        Performs a deeper health check beyond just checking if the process is running.
+        Returns a tuple (is_healthy, message)
+        """
+        if not self.process or self.process.poll() is not None:
+            return False, "Process not running"
+
+        # Check for common error patterns in logs
+        recent_logs = list(self.log_lines)[-20:]  # Last 20 log entries
+
+        if any("Connection refused" in line for line in recent_logs):
+            return False, "No listener on local port"
+        if any("Connection closed" in line for line in recent_logs):
+            return False, "Connection closed by remote host"
+        if any("Permission denied" in line for line in recent_logs):
+            return False, "SSH authentication failed"
+        if any("Host key verification failed" in line for line in recent_logs):
+            return False, "Host key verification failed"
+
+        return True, "Healthy"
 
     # -----------------------------------------------------------------
     # (de)serialisation helpers
@@ -204,6 +231,7 @@ class SSHConnection:
         obj.last_error     = d.get("last_error", "")
         obj.active         = d.get("active", False)     # <- keep flag
         return obj
+
 # ------------------------------------------------------------------
 # Persistence
 # ------------------------------------------------------------------
@@ -243,24 +271,72 @@ def save_connections():
 # ------------------------------------------------------------------
 def connection_monitor():
     """
-    Runs forever.  Restarts tunnels that died, pushes status updates
-    to the browser via Socket‑IO.
+    Runs forever. Monitors tunnels and implements a robust reconnection strategy
+    with exponential backoff for failed connections.
     """
+    # Track retry attempts and next retry time for each connection
+    retry_state = {}  # name -> {"attempts": int, "next_retry": timestamp}
+
     while True:
+        current_time = time.time()
         changed = False
+
         for conn in list(connections.values()):
+            # Use check_health for more comprehensive status checking
+            is_healthy, health_msg = conn.check_health()
             was = conn.active
-            now = conn.is_active()
-            if was and not now:                 # died
-                print(f"{conn.name} died – restarting")
+            now = is_healthy
+            conn.status_message = health_msg  # Update status message
+
+            # Initialize retry state if not exists
+            if conn.name not in retry_state:
+                retry_state[conn.name] = {"attempts": 0, "next_retry": 0}
+
+            # Connection died
+            if was and not now:
+                print(f"{conn.name} died – attempting to restart")
                 conn.start()
                 changed = True
+                # Reset retry counter on fresh failure
+                retry_state[conn.name]["attempts"] = 1
+                retry_state[conn.name]["next_retry"] = current_time + 5
+
+            # Connection is inactive but should be retried
+            elif not now and retry_state[conn.name]["attempts"] > 0:
+                # Check if it's time for a retry
+                if current_time >= retry_state[conn.name]["next_retry"]:
+                    attempts = retry_state[conn.name]["attempts"]
+                    # Exponential backoff: 5, 10, 20, 40, 80... seconds up to 5 minutes
+                    backoff = min(5 * (2 ** (attempts - 1)), 300)
+
+                    print(f"{conn.name} reconnection attempt {attempts} after {backoff}s backoff")
+                    if conn.start():
+                        # Success - reset retry state
+                        retry_state[conn.name]["attempts"] = 0
+                    else:
+                        # Failed - increment counter and set next retry time
+                        retry_state[conn.name]["attempts"] += 1
+                        retry_state[conn.name]["next_retry"] = current_time + backoff
+
+                    changed = True
+
+            # Connection status changed (other than the cases above)
             elif was != now:
                 changed = True
+
+            # Clean up retry state for connections that are now active
+            if now and retry_state[conn.name]["attempts"] > 0:
+                retry_state[conn.name]["attempts"] = 0
+
+        # Remove retry state for connections that no longer exist
+        for name in list(retry_state.keys()):
+            if name not in connections:
+                del retry_state[name]
+
         if changed:
             save_connections()
-            socketio.emit("status_update", [c.to_dict()
-                                            for c in connections.values()])
+            socketio.emit("status_update", [c.to_dict() for c in connections.values()])
+
         socketio.sleep(5)
 
 socketio.start_background_task(connection_monitor)
@@ -408,3 +484,4 @@ if __name__ == "__main__":
         debug=False,
         allow_unsafe_werkzeug=True       # <‑‑ add this line
     )
+
