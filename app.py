@@ -85,9 +85,10 @@ class SSHConnection:
             "-R", f"0.0.0.0:{self.remote_port}:{HOST_GATEWAY}:{self.local_port}",
             "-i", self.key_path,
             "-p", str(self.ssh_port),
-            "-o", f"ServerAliveInterval={self.alive_interval}",
+            "-o", f"ServerAliveInterval=30",  # Change: 30s to detect failures faster
+            "-o", "ServerAliveCountMax=3",    # NEW: Disconnect after 3 failures of keep alive
             "-o", f"ExitOnForwardFailure={'yes' if self.exit_on_failure else 'no'}",
-            "-v",                 # <-- 1× verbose; add -vv if you want more
+            "-vv",                 # <-- 1× verbose; add -vv if you want more
             dest,
         ]
 
@@ -177,26 +178,43 @@ class SSHConnection:
             self.last_error = "\n".join(self.log_lines)
         return False
 
+# Dentro da classe SSHConnection
     def check_health(self):
         """
         Performs a deeper health check beyond just checking if the process is running.
         Returns a tuple (is_healthy, message)
         """
         if not self.process or self.process.poll() is not None:
+            print(f"[{self.name}] Health check: Process not running (poll={self.process.poll() if self.process else 'None'})")  # Novo: Log para depuração
             return False, "Process not running"
 
         # Check for common error patterns in logs
         recent_logs = list(self.log_lines)[-20:]  # Last 20 log entries
+        print(f"[{self.name}] Health check: Recent logs: {recent_logs[:5]}...")  # Novo: Loga amostra para depuração (evita spam)
 
-        if any("Connection refused" in line for line in recent_logs):
-            return False, "No listener on local port"
-        if any("Connection closed" in line for line in recent_logs):
-            return False, "Connection closed by remote host"
-        if any("Permission denied" in line for line in recent_logs):
-            return False, "SSH authentication failed"
-        if any("Host key verification failed" in line for line in recent_logs):
-            return False, "Host key verification failed"
+        error_patterns = [
+            "Connection refused",      # No local listener
+            "Connection closed",       # Remote closed
+            "Permission denied",       # Auth failed
+            "Host key verification failed",  # Key issues
+            "Connection reset by peer",  # Network drop
+            "Broken pipe",             # Network interruption
+            "Read from socket failed", # Network failure
+            "remote port forwarding failed",  # Port binding issues
+            "ssh: connect to host",    # Connection timeout (partial match)
+            "Network is unreachable",  # Internet down
+            "Timeout",                 # NOVO: Detecta timeouts como nos seus logs
+            "not responding",          # NOVO: Detecta "server not responding"
+            "channel .* free",         # NOVO: Detecta canais liberados prematuramente (indicando falha)
+        ]
 
+        for pattern in error_patterns:
+            if any(pattern.lower() in line.lower() for line in recent_logs):  # Case-insensitive para robustez
+                error_msg = f"Error detected in logs: {pattern}"
+                print(f"[{self.name}] Health check: {error_msg}")  # Novo: Loga o erro detectado
+                return False, error_msg
+
+        print(f"[{self.name}] Health check: Healthy")  # Novo: Confirmação
         return True, "Healthy"
 
     # -----------------------------------------------------------------
