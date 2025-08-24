@@ -6,6 +6,8 @@ This version simplifies state management, improves thread safety,
 and uses standard logging for better reliability.
 """
 
+import signal
+import atexit
 import os
 import json
 import subprocess
@@ -60,14 +62,24 @@ class SSHConnection:
     """
     Manages a single SSH tunnel subprocess, its state, and retry logic.
     """
-    ## Refactor: Connection states for clearer and more robust state management.
+
     STATE_STOPPED = "Stopped"
     STATE_RUNNING = "Running"
     STATE_FAILED = "Failed"
     STATE_STARTING = "Starting"
 
-    def __init__(self, name, local_port, remote_port, vps_ip, vps_user, key_path,
-                 ssh_port=22, exit_on_failure=True):
+    def __init__(
+        self,
+        name,
+        local_port,
+        remote_port,
+        vps_ip,
+        vps_user,
+        key_path,
+        ssh_port=22,
+        exit_on_failure=True,
+        autostart=False,
+    ):
         self.name = name
         self.local_port = int(local_port)
         self.remote_port = int(remote_port)
@@ -77,28 +89,39 @@ class SSHConnection:
         self.ssh_port = int(ssh_port)
         self.exit_on_failure = bool(exit_on_failure)
 
+        # Persisted user intent: auto-start unless manually stopped
+        self.autostart = bool(autostart)
+
         # Runtime state
         self.process = None
         self.log_lines = collections.deque(maxlen=100)
         self.state = self.STATE_STOPPED
         self.status_message = "Not started yet."
 
-        ## Refactor: Retry logic is now part of the connection object itself.
+        # Retry logic state
         self.retry_attempts = 0
         self.next_retry_time = 0
 
     def _build_cmd(self):
         dest = f"{self.vps_user}@{self.vps_ip}" if self.vps_user else self.vps_ip
         return [
-            "ssh", "-vv",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
-            "-o", f"ExitOnForwardFailure={'yes' if self.exit_on_failure else 'no'}",
-            "-N", # Do not execute a remote command.
-            "-R", f"0.0.0.0:{self.remote_port}:{HOST_GATEWAY}:{self.local_port}",
-            "-i", self.key_path,
-            "-p", str(self.ssh_port),
+            "ssh",
+            "-vv",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            f"ExitOnForwardFailure={'yes' if self.exit_on_failure else 'no'}",
+            "-N",
+            "-R",
+            f"0.0.0.0:{self.remote_port}:{HOST_GATEWAY}:{self.local_port}",
+            "-i",
+            self.key_path,
+            "-p",
+            str(self.ssh_port),
             dest,
         ]
 
@@ -109,18 +132,30 @@ class SSHConnection:
             if line:
                 self.log_lines.append(line)
                 logging.info(f"[{self.name}] {line}")
-        logging.info(f"[{self.name}] Stderr stream finished, process has exited.")
+        logging.info(
+            f"[{self.name}] Stderr stream finished, process has exited."
+        )
 
     def start(self):
         """Initiates the connection attempt."""
         if self.process and self.process.poll() is None:
-            logging.warning(f"[{self.name}] Start called but process is already running.")
+            logging.warning(
+                f"[{self.name}] Start called but process is already running."
+            )
             return True
+
+        # When user starts, we set autostart True
+        self.autostart = True
+        self.next_retry_time = 0
+        self.retry_attempts = 0
 
         self.state = self.STATE_STARTING
         self.status_message = "Attempting to start..."
         self.log_lines.clear()
-        self.log_lines.append(f"Starting connection at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.log_lines.append(
+            f"Starting connection at "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
         try:
             os.chmod(self.key_path, 0o600)
@@ -137,7 +172,7 @@ class SSHConnection:
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=1
             )
             threading.Thread(target=self._pump_stderr, daemon=True).start()
-            self.retry_attempts = 0 # Reset on a successful spawn
+            self.retry_attempts = 0
             return True
         except Exception as e:
             self.status_message = "Failed to spawn ssh"
@@ -147,58 +182,84 @@ class SSHConnection:
 
     def stop(self):
         """Stops the connection."""
+        # When user stops, we set autostart False
+        self.autostart = False
         self.state = self.STATE_STOPPED
         self.status_message = "Stopped by user."
-        self.retry_attempts = 0 # User stopped, so no retries needed.
+        self.retry_attempts = 0
+        self.next_retry_time = 0
         if self.process and self.process.poll() is None:
             logging.info(f"[{self.name}] Terminating process.")
             self.process.terminate()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                logging.warning(f"[{self.name}] Process did not terminate, killing.")
+                logging.warning(
+                    f"[{self.name}] Process did not terminate, killing."
+                )
                 self.process.kill()
         self.process = None
 
     def update_status(self):
-        """Checks the process and logs, and updates the connection's state. The single source of truth."""
+        """
+        Checks the process and logs, and updates the connection's state.
+        The single source of truth.
+        """
         if self.state == self.STATE_STOPPED:
-            return # Don't check if it was manually stopped.
+            return  # Don't check if it was manually stopped.
 
         if not self.process or self.process.poll() is not None:
             # Process is not running.
             if self.state != self.STATE_FAILED:
                 self.status_message = "Connection failed."
-                logging.warning(f"[{self.name}] Connection died unexpectedly.")
+                logging.warning(
+                    f"[{self.name}] Connection died unexpectedly."
+                )
             self.state = self.STATE_FAILED
             return
 
         # Process is running, check for common error messages in logs.
         error_patterns = [
-            "connection refused", "permission denied", "port forwarding failed",
-            "connection closed by", "connection reset by peer", "broken pipe",
-            "timeout", "server not responding", "host key verification failed"
+            "connection refused",
+            "permission denied",
+            "port forwarding failed",
+            "connection closed by",
+            "connection reset by peer",
+            "broken pipe",
+            "timeout",
+            "server not responding",
+            "host key verification failed",
         ]
         recent_logs = list(self.log_lines)[-10:]
         for pattern in error_patterns:
             if any(pattern in line.lower() for line in recent_logs):
                 self.state = self.STATE_FAILED
-                self.status_message = f"Error detected in logs: '{pattern}'"
+                self.status_message = (
+                    f"Error detected in logs: '{pattern}'"
+                )
                 logging.warning(f"[{self.name}] {self.status_message}")
                 return
 
         # If we reach here, the connection is considered healthy.
         self.state = self.STATE_RUNNING
         self.status_message = "Active"
-        self.retry_attempts = 0 # It's healthy, so reset retry count.
+        self.retry_attempts = 0
 
     def schedule_retry(self):
-        """Calculates and sets the next retry time using exponential backoff."""
+        """Sets the next retry time using exponential backoff."""
         self.retry_attempts += 1
-        backoff = min(RETRY_BASE_SECONDS * (2 ** (self.retry_attempts - 1)), RETRY_MAX_SECONDS)
+        backoff = min(
+            RETRY_BASE_SECONDS * (2 ** (self.retry_attempts - 1)),
+            RETRY_MAX_SECONDS,
+        )
         self.next_retry_time = time.time() + backoff
-        self.status_message = f"Connection failed. Retrying in {int(backoff)}s..."
-        logging.info(f"[{self.name}] Scheduling retry attempt {self.retry_attempts} in {backoff:.0f} seconds.")
+        self.status_message = (
+            f"Connection failed. Retrying in {int(backoff)}s..."
+        )
+        logging.info(
+            f"[{self.name}] Scheduling retry attempt "
+            f"{self.retry_attempts} in {backoff:.0f} seconds."
+        )
 
     def to_dict(self):
         """Serializes the connection object to a dictionary for the API/UI."""
@@ -211,25 +272,46 @@ class SSHConnection:
             "key_path": self.key_path,
             "ssh_port": self.ssh_port,
             "exit_on_failure": self.exit_on_failure,
+            "autostart": self.autostart,
             "state": self.state,
             "status_message": self.status_message,
             "log": list(self.log_lines),
-            # "active" is deprecated in favor of "state" but can be kept for frontend compatibility
+            # "active" kept for frontend compatibility
             "active": self.state == self.STATE_RUNNING,
         }
 
     @classmethod
     def from_dict(cls, data):
         """Creates a connection object from a dictionary."""
+        # Back-compat for older configs: infer autostart if missing.
+        prev_state = data.get("state")
+        prev_active = data.get("active")
+        autostart = data.get("autostart")
+        if autostart is None:
+            autostart = bool(prev_active) or (
+                prev_state is not None and prev_state != cls.STATE_STOPPED
+            )
+
         conn = cls(
-            data["name"], data["local_port"], data["remote_port"],
-            data["vps_ip"], data["vps_user"], data["key_path"],
-            data.get("ssh_port", 22), data.get("exit_on_failure", True)
+            data["name"],
+            data["local_port"],
+            data["remote_port"],
+            data["vps_ip"],
+            data.get("vps_user"),
+            data["key_path"],
+            data.get("ssh_port", 22),
+            data.get("exit_on_failure", True),
+            autostart=autostart,
         )
-        # If it was running before, mark it as failed so the monitor will try to restart it.
-        if data.get("active") or data.get("state") == cls.STATE_RUNNING:
+
+        # On load, derive initial runtime state from intent:
+        if conn.autostart:
             conn.state = cls.STATE_FAILED
             conn.status_message = "Scheduled for auto-restart."
+        else:
+            conn.state = cls.STATE_STOPPED
+            conn.status_message = "Stopped (manual)."
+
         return conn
 
 # ------------------------------------------------------------------
@@ -264,26 +346,38 @@ def connection_monitor():
     logging.info("Connection monitor started.")
     while True:
         with connections_lock:
-            # Create a copy to iterate over, avoiding locking during the main logic.
             conns_to_check = list(connections.values())
 
         changed = False
+        now = time.time()
+
         for conn in conns_to_check:
             initial_state = conn.state
             conn.update_status()
 
-            if conn.state == SSHConnection.STATE_FAILED and conn.retry_attempts == 0:
-                # This is a fresh failure, schedule the first retry.
+            # Only manage connections that are intended to auto-start
+            if not conn.autostart:
+                if conn.state != initial_state:
+                    changed = True
+                continue
+
+            if (
+                conn.state == SSHConnection.STATE_FAILED
+                and conn.retry_attempts == 0
+            ):
+                # Fresh failure or just loaded; schedule first retry
                 conn.schedule_retry()
                 changed = True
-            elif conn.state == SSHConnection.STATE_FAILED and time.time() >= conn.next_retry_time:
-                # It's time to retry a failed connection.
+            elif (
+                conn.state == SSHConnection.STATE_FAILED
+                and now >= conn.next_retry_time
+            ):
+                # Time to retry a failed connection
                 logging.info(f"[{conn.name}] Attempting scheduled restart.")
                 if conn.start():
-                    # After starting, let the next cycle's update_status determine the outcome.
+                    # Let next loop determine health
                     pass
                 else:
-                    # Immediate failure to start, schedule next retry.
                     conn.schedule_retry()
                 changed = True
 
@@ -292,12 +386,11 @@ def connection_monitor():
 
         if changed:
             save_connections()
-            # Emit the full status to all clients
             with connections_lock:
                 status_list = [c.to_dict() for c in connections.values()]
             socketio.emit("status_update", status_list)
 
-        socketio.sleep(5) # Check every 5 seconds.
+        socketio.sleep(5)
 
 # ------------------------------------------------------------------
 # API Route Helpers / Decorators
@@ -432,13 +525,27 @@ def api_public_key(name):
 # ------------------------------------------------------------------
 # App Start-up
 # ------------------------------------------------------------------
+
+def _persist_on_shutdown(signum=None, frame=None):
+    try:
+        logging.info("Shutting down, saving connections...")
+        save_connections()
+    except Exception as e:
+        logging.error(f"Error saving on shutdown: {e}")
+
 if __name__ == "__main__":
     load_connections()
+
+    # Save state on SIGTERM/SIGINT and normal exit
+    signal.signal(signal.SIGTERM, _persist_on_shutdown)
+    signal.signal(signal.SIGINT, _persist_on_shutdown)
+    atexit.register(_persist_on_shutdown)
+
     socketio.start_background_task(connection_monitor)
     socketio.run(
         app,
         host="0.0.0.0",
         port=5000,
         debug=False,
-        allow_unsafe_werkzeug=True # Required for this setup in recent versions.
+        allow_unsafe_werkzeug=True,  # Required for this setup in recent versions.
     )
